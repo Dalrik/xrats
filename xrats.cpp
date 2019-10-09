@@ -15,7 +15,6 @@ static std::string RatWindowClass = "xeyes";
 
 static Atom WindowClassAtom;
 static Atom WindowTypeAtom;
-static Atom WindowTypeDialog;
 
 std::array ObscuringWindowTypeStrings{
     "_NET_WM_WINDOW_TYPE_NORMAL",
@@ -190,8 +189,8 @@ int main(int argc, const char *argv[]) {
 
     WindowClassAtom = XInternAtom(display, "WM_CLASS", false);
     WindowTypeAtom  = XInternAtom(display, "_NET_WM_WINDOW_TYPE", false);
-    WindowTypeDialog =
-        XInternAtom(display, "_NET_WM_WINDOW_TYPE_DIALOG", false);
+    Atom WindowTypeSplash =
+        XInternAtom(display, "_NET_WM_WINDOW_TYPE_SPLASH", false);
 
     Atom WMState = XInternAtom(display, "_NET_WM_STATE", false);
     Atom WMStateSkipTaskbar =
@@ -205,16 +204,16 @@ int main(int argc, const char *argv[]) {
     CollectWindowTree(display, rootWindow, 0, 0);
 
     for (const auto entry : RatWindows) {
-        if (entry.second->wmType != WindowTypeDialog) {
-            printf("Attempting to change property on window 0x%X\n",
+        if (entry.second->wmType != WindowTypeSplash) {
+            printf("Adopting unmodified rat window 0x%X\n",
                    (unsigned int)entry.second->window);
             XChangeProperty(
                 display, entry.second->window, WindowTypeAtom, XA_ATOM, 32,
                 PropModeReplace,
-                reinterpret_cast<const unsigned char *>(&WindowTypeDialog), 1);
+                reinterpret_cast<const unsigned char *>(&WindowTypeSplash), 1);
 
-            // For awesomeWM at least, this unmap-map cycle kicks the WM enough
-            // for it to notice the switch to WindowTypeDialog
+            // This unmap-map cycle kicks the WM enough for it to notice the
+            // switch to WindowTypeSplash
             XUnmapWindow(display, entry.second->window);
             XMapWindow(display, entry.second->window);
 
