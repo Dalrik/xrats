@@ -1,7 +1,10 @@
 #include <algorithm>
 #include <array>
+#include <map>
+#include <memory>
 
 #include <string.h>
+#include <unistd.h>
 
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
@@ -12,6 +15,7 @@ static std::string RatWindowClass = "xeyes";
 
 static Atom WindowClassAtom;
 static Atom WindowTypeAtom;
+static Atom WindowTypeDialog;
 
 std::array ObscuringWindowTypeStrings{
     "_NET_WM_WINDOW_TYPE_NORMAL",
@@ -22,73 +26,113 @@ std::array ObscuringWindowTypeStrings{
 
 std::array<Atom, ObscuringWindowTypeStrings.size()> ObscuringWindowTypeAtoms;
 
-bool IsObscuringWindow(Display *display, Window window) {
-    bool isObscuring = false;
+struct TrackedWindow {
+    Display *display;
+    Window   window;
+    Atom     wmType;
+    int      ioClass;
+    int      mapState;
 
-    Atom           propType;
-    int            propFormat;
-    unsigned long  numItems;
-    unsigned long  bytesRemaining;
-    unsigned char *prop = nullptr;
+    bool isRat;
 
-    XGetWindowProperty(display, window, WindowTypeAtom, 0, sizeof(Atom), false,
-                       XA_ATOM, &propType, &propFormat, &numItems,
-                       &bytesRemaining, &prop);
+    int x;
+    int y;
+    int width;
+    int height;
 
-    if (propType == XA_ATOM && numItems > 0 && prop) {
-        Atom windowType;
-        memcpy(&windowType, prop, sizeof(windowType));
+    TrackedWindow(Display *display_, Window window_, int parentX, int parentY)
+        : display(display_), window(window_), isRat(false), wmType(0) {
+        UpdateAttributes(parentX, parentY);
 
-        if (std::find(ObscuringWindowTypeAtoms.begin(),
-                      ObscuringWindowTypeAtoms.end(),
-                      windowType) != ObscuringWindowTypeAtoms.end()) {
-            isObscuring = true;
+        // Determine whether this window is a rat
+        {
+            XTextProperty classProp;
+            XGetTextProperty(display, window, &classProp, WindowClassAtom);
+            if (classProp.encoding == XA_STRING) {
+                char **classList;
+                int    numClasses;
+                XTextPropertyToStringList(&classProp, &classList, &numClasses);
+
+                for (int i = 0; i < numClasses; ++i) {
+                    if (classList[i] == RatWindowClass) {
+                        isRat = true;
+                        break;
+                    }
+                }
+
+                XFreeStringList(classList);
+            }
+            XFree(classProp.value);
         }
-    }
 
-    if (prop) {
-        XFree(prop);
-    }
+        // Get the window's WM type, if it's defined
+        {
+            Atom           propType;
+            int            propFormat;
+            unsigned long  numItems;
+            unsigned long  bytesRemaining;
+            unsigned char *prop = nullptr;
 
-    return isObscuring;
-}
+            XGetWindowProperty(display, window, WindowTypeAtom, 0, sizeof(Atom),
+                               false, XA_ATOM, &propType, &propFormat,
+                               &numItems, &bytesRemaining, &prop);
 
-bool IsRatWindow(Display *display, Window window) {
-    bool isRat = false;
+            if (propType == XA_ATOM && numItems > 0 && prop) {
+                memcpy(&wmType, prop, sizeof(wmType));
+            }
 
-    XTextProperty classProp;
-    XGetTextProperty(display, window, &classProp, WindowClassAtom);
-
-    if (classProp.encoding == XA_STRING) {
-        char **classList;
-        int    numClasses;
-        XTextPropertyToStringList(&classProp, &classList, &numClasses);
-
-        for (int i = 0; i < numClasses; ++i) {
-            if (classList[i] == RatWindowClass) {
-                isRat = true;
-                break;
+            if (prop) {
+                XFree(prop);
             }
         }
-
-        XFreeStringList(classList);
     }
 
-    XFree(classProp.value);
+    void UpdateAttributes(int parentX, int parentY) {
+        XWindowAttributes attributes;
+        XGetWindowAttributes(display, window, &attributes);
 
-    return isRat;
-}
+        x        = parentX + attributes.x;
+        y        = parentY + attributes.y;
+        width    = attributes.width;
+        height   = attributes.height;
+        ioClass  = attributes.c_class;
+        mapState = attributes.map_state;
+    }
 
-void ProcessWindow(Display *display, Window window, int parentX, int parentY,
+    bool CanHideRats(void) const {
+        return std::find(ObscuringWindowTypeAtoms.begin(),
+                         ObscuringWindowTypeAtoms.end(),
+                         wmType) != ObscuringWindowTypeAtoms.end();
+    }
+
+    bool IsVisible(void) const {
+        return ioClass == InputOutput && mapState == IsViewable;
+    }
+};
+
+static std::map<Window, std::shared_ptr<TrackedWindow>> OldRatWindows;
+static std::map<Window, std::shared_ptr<TrackedWindow>> RatWindows;
+static std::map<Window, std::shared_ptr<TrackedWindow>> ObscuringWindows;
+
+void CollectWindow(Display *display, Window window, int parentX, int parentY,
                    int *windowX, int *windowY) {
-    XWindowAttributes attributes;
-    XGetWindowAttributes(display, window, &attributes);
+    auto it = OldRatWindows.find(window);
 
-    *windowX = parentX + attributes.x;
-    *windowY = parentY + attributes.y;
+    std::shared_ptr<TrackedWindow> tWindow = nullptr;
 
-    if (attributes.c_class != InputOutput ||
-        attributes.map_state != IsViewable) {
+    if (it != OldRatWindows.end()) {
+        tWindow = it->second;
+        tWindow->UpdateAttributes(parentX, parentY);
+        OldRatWindows.erase(it);
+    } else {
+        tWindow =
+            std::make_unique<TrackedWindow>(display, window, parentX, parentY);
+    }
+
+    *windowX = tWindow->x;
+    *windowY = tWindow->y;
+
+    if (!tWindow->IsVisible()) {
         return;
     }
 
@@ -96,25 +140,28 @@ void ProcessWindow(Display *display, Window window, int parentX, int parentY,
 
     // The order is important here. Rats don't satisfy the Obscuring window
     // heuristic because they don't specify _NET_WM_WINDOW_TYPE
-    if (IsRatWindow(display, window)) {
+    if (tWindow->isRat) {
         windowType = "Rat";
-    } else if (!IsObscuringWindow(display, window)) {
+        RatWindows.emplace(tWindow->window, tWindow);
+    } else if (tWindow->CanHideRats()) {
+        ObscuringWindows.emplace(tWindow->window, tWindow);
+    } else {
         return;
     }
 
     XTextProperty nameProp;
-    XGetWMName(display, window, &nameProp);
-    printf("%s: 0x%X (%d+%d,%d+%d) %s\n", windowType, (unsigned int)window,
-           *windowX, attributes.width, *windowY, attributes.height,
-           nameProp.value);
+    XGetWMName(display, tWindow->window, &nameProp);
+    printf("%s: 0x%X (%d+%d,%d+%d) %s\n", windowType,
+           (unsigned int)tWindow->window, tWindow->x, tWindow->width,
+           tWindow->y, tWindow->height, nameProp.value);
     XFree(nameProp.value);
 }
 
-void ProcessWindowTree(Display *display, Window window, int parentX,
+void CollectWindowTree(Display *display, Window window, int parentX,
                        int parentY) {
 
     int thisWindowX, thisWindowY;
-    ProcessWindow(display, window, parentX, parentY, &thisWindowX,
+    CollectWindow(display, window, parentX, parentY, &thisWindowX,
                   &thisWindowY);
 
     Window       rootWindow;
@@ -125,7 +172,7 @@ void ProcessWindowTree(Display *display, Window window, int parentX,
                &numChildren);
 
     for (unsigned int i = 0; i < numChildren; ++i) {
-        ProcessWindowTree(display, childList[i], thisWindowX, thisWindowY);
+        CollectWindowTree(display, childList[i], thisWindowX, thisWindowY);
     }
 
     XFree(childList);
@@ -143,10 +190,57 @@ int main(int argc, const char *argv[]) {
 
     WindowClassAtom = XInternAtom(display, "WM_CLASS", false);
     WindowTypeAtom  = XInternAtom(display, "_NET_WM_WINDOW_TYPE", false);
+    WindowTypeDialog =
+        XInternAtom(display, "_NET_WM_WINDOW_TYPE_DIALOG", false);
+
+    Atom WMState = XInternAtom(display, "_NET_WM_STATE", false);
+    Atom WMStateSkipTaskbar =
+        XInternAtom(display, "_NET_WM_STATE_SKIP_TASKBAR", false);
+    Atom WMStateSkipPager =
+        XInternAtom(display, "_NET_WM_STATE_SKIP_PAGER", false);
+    Atom WMStateBelow = XInternAtom(display, "_NET_WM_STATE_BELOW", false);
 
     const Window rootWindow = DefaultRootWindow(display);
 
-    ProcessWindowTree(display, rootWindow, 0, 0);
+    CollectWindowTree(display, rootWindow, 0, 0);
+
+    for (const auto entry : RatWindows) {
+        if (entry.second->wmType != WindowTypeDialog) {
+            printf("Attempting to change property on window 0x%X\n",
+                   (unsigned int)entry.second->window);
+            XChangeProperty(
+                display, entry.second->window, WindowTypeAtom, XA_ATOM, 32,
+                PropModeReplace,
+                reinterpret_cast<const unsigned char *>(&WindowTypeDialog), 1);
+
+            // For awesomeWM at least, this unmap-map cycle kicks the WM enough
+            // for it to notice the switch to WindowTypeDialog
+            XUnmapWindow(display, entry.second->window);
+            XMapWindow(display, entry.second->window);
+
+            XClientMessageEvent clientEvent = {
+                .type         = ClientMessage,
+                .window       = entry.second->window,
+                .message_type = WMState,
+                .format       = 32,
+            };
+            clientEvent.data.l[0] = 1; // _NET_WM_STATE_ADD
+            clientEvent.data.l[1] = WMStateSkipPager;
+            clientEvent.data.l[2] = WMStateSkipTaskbar;
+            XSendEvent(display, rootWindow, false,
+                       (SubstructureNotifyMask | SubstructureRedirectMask),
+                       reinterpret_cast<XEvent *>(&clientEvent));
+            clientEvent.data.l[1] = WMStateBelow;
+            clientEvent.data.l[2] = 0;
+            XSendEvent(display, rootWindow, false,
+                       (SubstructureNotifyMask | SubstructureRedirectMask),
+                       reinterpret_cast<XEvent *>(&clientEvent));
+        }
+    }
+
+    XFlush(display);
+
+    XCloseDisplay(display);
 
     return 0;
 }
